@@ -1,0 +1,90 @@
+name: Deploy to Production
+ 
+on:
+  push:
+    branches:
+      - main
+ 
+jobs:
+
+  # ─── Job 2: Deploy ────────────────────────────────────────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+ 
+    steps:
+      # ─── 1. Checkout ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+ 
+      # ─── 2. Deploy to EC2 ───────────────────────────────────────────────
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          envs: GH_TOKEN
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /home/ubuntu/university-library
+ 
+            # ── Auth ──────────────────────────────────────────────────────
+            git config --local credential.helper \
+              '!f() { echo "username=x-access-token"; echo "password='"$GH_TOKEN"'"; }; f'
+ 
+            # ── Pull latest ───────────────────────────────────────────────
+            git fetch origin
+            git reset --hard origin/main
+            git clean -fd
+ 
+            # ── Install & build ───────────────────────────────────────────
+            npm install
+            npm run build
+ 
+            # ── Graceful restart ──────────────────────────────────────────
+            pm2 reload app || pm2 start "serve -s dist -l 3000" --name app
+            pm2 save
+ 
+            # ── Cleanup ───────────────────────────────────────────────────
+            git config --local --unset credential.helper
+ 
+            # ── Health check ──────────────────────────────────────────────
+            echo "Running health check..."
+            MAX_RETRIES=4
+            RETRY_INTERVAL=5
+            HEALTH_URL="http://localhost:3000"
+            SUCCESS=false
+ 
+            for i in $(seq 1 $MAX_RETRIES); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null) || STATUS="000"
+              if [ "$STATUS" = "200" ]; then
+                echo "Health check passed (attempt $i) — app is live"
+                SUCCESS=true
+                break
+              fi
+              echo "Attempt $i/$MAX_RETRIES — got HTTP $STATUS, retrying in ${RETRY_INTERVAL}s..."
+              sleep $RETRY_INTERVAL
+            done
+ 
+            if [ "$SUCCESS" != "true" ]; then
+              echo "Health check failed after $MAX_RETRIES attempts — rolling back..."
+              pm2 stop app
+              git reset --hard HEAD~1
+              npm install
+              npm run build
+              pm2 start app --update-env
+              pm2 save
+              echo "::error::Deploy failed — rolled back to previous version"
+              exit 1
+            fi
+ 
+      # ─── 3. Notify on failure ─────────────────────────────────────────────
+      - name: Notify on failure
+        if: failure()
+        run: echo "::error::Deployment failed on $(date -u). Check deploy logs."
